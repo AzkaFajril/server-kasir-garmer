@@ -7,36 +7,57 @@ require('dotenv').config();
 const app = express();
 
 // =======================
-// CORS
+// ALLOWED ORIGINS
 // =======================
 const allowedOrigins = [
   'http://localhost:5173',
   'https://kasirtokogarmer.netlify.app'
 ];
 
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Mengizinkan request tanpa origin (Postman, curl, server)
-      if (!origin) return callback(null, true);
+// =======================
+// BLOCK REQUEST DARI WEBSITE LAIN
+// =======================
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
 
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+  // Izinkan request tanpa Origin (misalnya health check dari server)
+  if (!origin) {
+    return next();
+  }
 
-      return callback(new Error('Not allowed by CORS'));
-    },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: true,
-  })
-);
+  if (allowedOrigins.includes(origin)) {
+    return next();
+  }
+
+  return res.status(403).json({
+    success: false,
+    message: 'Access denied'
+  });
+});
+
+// =======================
+// CORS
+// =======================
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
 // =======================
-// Import Routes
+// ROUTES
 // =======================
 const authRoutes = require('./routes/authRoutes');
 const categoryRoutes = require('./routes/categoryRoutes');
@@ -50,9 +71,6 @@ const dashboardRoutes = require('./routes/dashboardRoutes');
 const profileRoutes = require('./routes/profileRoutes');
 const expenseRoutes = require('./routes/expenseRoutes');
 
-// =======================
-// Routes
-// =======================
 app.use('/api/auth', authRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/products', productRoutes);
@@ -66,18 +84,14 @@ app.use('/api/profile', profileRoutes);
 app.use('/api/expenses', expenseRoutes);
 
 // =======================
-// Test API
+// TEST
 // =======================
 app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    message: 'Server POS API Berjalan!'
-  });
+  res.send('Server POS API Berjalan!');
 });
 
 const PORT = process.env.PORT || 5000;
 
-// Local
 if (process.env.NODE_ENV !== 'production') {
   app.listen(PORT, () => {
     console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
