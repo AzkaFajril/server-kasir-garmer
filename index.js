@@ -71,18 +71,20 @@ const dashboardRoutes = require('./routes/dashboardRoutes');
 const profileRoutes = require('./routes/profileRoutes');
 const expenseRoutes = require('./routes/expenseRoutes');
 
-app.use('/api/auth', authRoutes);
-app.use('/api/categories', categoryRoutes);
-app.use('/api/products', productRoutes);
-app.use('/api/orders', orderRoutes);
-app.use('/api/stock', stockRoutes);
-app.use('/api/reports', reportRoutes);
-app.use('/api/users', userRoutes);
-app.use('/api/hr', hrRoutes);
-app.use('/api/dashboard', dashboardRoutes);
-app.use('/api/profile', profileRoutes);
-app.use('/api/expenses', expenseRoutes);
+const verifyToken = require('./middleware/authMiddleware');
 
+app.use('/api/auth', authRoutes); // public
+
+app.use('/api/categories', verifyToken, categoryRoutes);
+app.use('/api/products', verifyToken, productRoutes);
+app.use('/api/orders', verifyToken, orderRoutes);
+app.use('/api/stock', verifyToken, stockRoutes);
+app.use('/api/reports', verifyToken, reportRoutes);
+app.use('/api/users', verifyToken, userRoutes);
+app.use('/api/hr', verifyToken, hrRoutes);
+app.use('/api/dashboard', verifyToken, dashboardRoutes);
+app.use('/api/profile', verifyToken, profileRoutes);
+app.use('/api/expenses', verifyToken, expenseRoutes);
 // =======================
 // TEST
 // =======================
