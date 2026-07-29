@@ -28,7 +28,7 @@ const makeWIBDate = (dateStr, timeStr) => {
 // ==========================================
 const getShifts = async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM shifts ORDER BY start_time ASC');
+        const result = await pool.query('SELECT * FROM shifts ORDER BY is_flexible ASC, start_time ASC');
         res.json(result.rows);
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -37,10 +37,17 @@ const getShifts = async (req, res) => {
 
 const createShift = async (req, res) => {
     try {
-        const { name, start_time, end_time } = req.body;
+        const { name, start_time, end_time, is_flexible } = req.body;
+
+        // Shift flexible: jam mulai/selesai tidak wajib (boleh NULL)
+        const flexible = !!is_flexible;
+        if (!flexible && (!start_time || !end_time)) {
+            return res.status(400).json({ message: 'Jam mulai dan jam selesai wajib diisi untuk shift non-flexible' });
+        }
+
         const result = await pool.query(
-            'INSERT INTO shifts (name, start_time, end_time) VALUES ($1, $2, $3) RETURNING *',
-            [name, start_time, end_time]
+            'INSERT INTO shifts (name, start_time, end_time, is_flexible) VALUES ($1, $2, $3, $4) RETURNING *',
+            [name, flexible ? null : start_time, flexible ? null : end_time, flexible]
         );
         res.status(201).json({ message: 'Shift berhasil dibuat', data: result.rows[0] });
     } catch (error) {
@@ -51,10 +58,16 @@ const createShift = async (req, res) => {
 const updateShift = async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, start_time, end_time } = req.body;
+        const { name, start_time, end_time, is_flexible } = req.body;
+
+        const flexible = !!is_flexible;
+        if (!flexible && (!start_time || !end_time)) {
+            return res.status(400).json({ message: 'Jam mulai dan jam selesai wajib diisi untuk shift non-flexible' });
+        }
+
         const result = await pool.query(
-            'UPDATE shifts SET name = $1, start_time = $2, end_time = $3 WHERE id = $4 RETURNING *',
-            [name, start_time, end_time, id]
+            'UPDATE shifts SET name = $1, start_time = $2, end_time = $3, is_flexible = $4 WHERE id = $5 RETURNING *',
+            [name, flexible ? null : start_time, flexible ? null : end_time, flexible, id]
         );
         if (result.rows.length === 0) return res.status(404).json({ message: 'Shift tidak ditemukan' });
         res.json({ message: 'Shift berhasil diperbarui', data: result.rows[0] });
@@ -88,20 +101,33 @@ const clockIn = async (req, res) => {
         const todayStr = formatLocalDate(nowWIB);
 
         const userQuery = await pool.query(
-            'SELECT u.shift_id, s.start_time, s.end_time FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1', 
+            'SELECT u.shift_id, s.start_time, s.end_time, s.is_flexible FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1',
             [user_id]
         );
-        
+
         if (userQuery.rows.length === 0) return res.status(404).json({ message: 'User tidak ditemukan' });
         if (!userQuery.rows[0].shift_id) return res.status(400).json({ message: 'Anda belum memiliki jadwal Shift.' });
 
+        const isFlexible = userQuery.rows[0].is_flexible;
+        const shiftDateStr = formatLocalDate(nowWIB);
+
+        // ---- SHIFT FLEXIBLE: bisa absen kapan saja, tidak ada batas jam & tidak pernah telat ----
+        if (isFlexible) {
+            const result = await pool.query(
+                'INSERT INTO attendances (user_id, date, clock_in, status, late_seconds) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+                [user_id, shiftDateStr, now, 'ontime', 0]
+            );
+            return res.status(201).json({ message: 'Berhasil Absen Masuk', data: result.rows[0] });
+        }
+
+        // ---- SHIFT TETAP: logika lama (batas waktu & perhitungan telat) ----
         const shiftStartTime = userQuery.rows[0].start_time; // "08:20:00"
         const shiftEndTime = userQuery.rows[0].end_time;
-        
+
         // Buat Date objects dalam WIB timezone
         let shiftStart = makeWIBDate(todayStr, shiftStartTime);
         let shiftEnd = makeWIBDate(todayStr, shiftEndTime);
-        
+
         // Handle shift melewati tengah malam
         if (shiftEnd <= shiftStart) {
             if (nowWIB.getHours() < 12) {
@@ -110,7 +136,7 @@ const clockIn = async (req, res) => {
                 shiftEnd = new Date(shiftEnd.getTime() + 24 * 60 * 60 * 1000);
             }
         }
-        
+
         const allowedStart = new Date(shiftStart.getTime() - 60 * 60 * 1000);
 
         if (now < allowedStart) return res.status(400).json({ message: `Belum waktunya! Shift dimulai jam ${shiftStartTime}` });
@@ -124,13 +150,11 @@ const clockIn = async (req, res) => {
             lateSeconds = Math.floor((now - shiftStart) / 1000);
         }
 
-        const shiftDateStr = formatLocalDate(nowWIB);
-
         const result = await pool.query(
             'INSERT INTO attendances (user_id, date, clock_in, status, late_seconds) VALUES ($1, $2, $3, $4, $5) RETURNING *',
             [user_id, shiftDateStr, now, status, lateSeconds]
         );
-        
+
         res.status(201).json({ message: 'Berhasil Absen Masuk', data: result.rows[0] });
     } catch (error) {
         if (error.code === '23505') return res.status(400).json({ message: 'Anda sudah absen masuk untuk shift ini!' });
@@ -146,14 +170,15 @@ const clockOut = async (req, res) => {
 
         // Ambil data shift user untuk cap waktu clock_out
         const userQuery = await pool.query(
-            'SELECT u.shift_id, s.start_time, s.end_time FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1',
+            'SELECT u.shift_id, s.start_time, s.end_time, s.is_flexible FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1',
             [user_id]
         );
 
         let clockOutTime = now;
+        const isFlexible = userQuery.rows.length > 0 && userQuery.rows[0].is_flexible;
 
-        // Jika user punya shift, cap clock_out di waktu shift berakhir
-        if (userQuery.rows.length > 0 && userQuery.rows[0].end_time) {
+        // Shift flexible: clock-out selalu di waktu sekarang, tidak di-cap ke jam shift
+        if (!isFlexible && userQuery.rows.length > 0 && userQuery.rows[0].end_time) {
             const todayStr = formatLocalDate(nowWIB);
             const shiftStartTime = userQuery.rows[0].start_time;
             const shiftEndTime = userQuery.rows[0].end_time;
@@ -189,6 +214,7 @@ const clockOut = async (req, res) => {
         res.status(500).json({ message: error.message });
     }
 };
+
 const deleteAttendance = async (req, res) => {
     try {
         const { id } = req.params;
@@ -234,34 +260,7 @@ const checkTodayAttendance = async (req, res) => {
             const nowWIB = getNowWIB();
             const today = formatLocalDate(nowWIB);
             const absenDate = formatLocalDate(new Date(lastAbsen.date));
-            
-            // Auto-close: jika masih terbuka dan shift sudah berakhir
-            if (lastAbsen.clock_in && !lastAbsen.clock_out) {
-                const userQuery = await pool.query(
-                    'SELECT s.start_time, s.end_time FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1',
-                    [user_id]
-                );
-                if (userQuery.rows.length > 0 && userQuery.rows[0].end_time) {
-                    const now = new Date();
-                    const shiftStartTime = userQuery.rows[0].start_time;
-                    const shiftEndTime = userQuery.rows[0].end_time;
-                    const clockDate = formatLocalDate(new Date(lastAbsen.date));
-                    let shiftEnd = makeWIBDate(clockDate, shiftEndTime);
-                    let shiftStart = makeWIBDate(clockDate, shiftStartTime);
-                    if (shiftEnd <= shiftStart) {
-                        shiftEnd = new Date(shiftEnd.getTime() + 24 * 60 * 60 * 1000);
-                    }
-                    // Jika sekarang sudah lewat shift end, auto-close attendance
-                    if (now > shiftEnd) {
-                        await pool.query(
-                            'UPDATE attendances SET clock_out = $1 WHERE id = $2',
-                            [shiftEnd, lastAbsen.id]
-                        );
-                        lastAbsen.clock_out = shiftEnd;
-                    }
-                }
-            }
-            
+
             if(absenDate === today || lastAbsen.clock_out === null) {
                 return res.json(lastAbsen);
             }
@@ -293,7 +292,7 @@ const submitLeave = async (req, res) => {
 const getEmployees = async (req, res) => {
     try {
         const query = `
-            SELECT u.id, u.name, u.base_salary, u.shift_id, s.name as shift_name, s.start_time, s.end_time
+            SELECT u.id, u.name, u.base_salary, u.shift_id, s.name as shift_name, s.start_time, s.end_time, s.is_flexible
             FROM users u LEFT JOIN shifts s ON u.shift_id = s.id ORDER BY u.id ASC
         `;
         const result = await pool.query(query);
@@ -315,6 +314,8 @@ const updateEmployeeHr = async (req, res) => {
 };
 
 // --- FUNGSI SAKTI: MENCEGAH GAJI BUTA KARENA LUPA ABSEN PULANG ---
+// Shift flexible: durasi kerja TIDAK di-cap oleh jam shift (karena tidak ada jam start/end),
+// dihitung apa adanya dari clock_in sampai clock_out (atau NOW jika masih terbuka).
 const getPayrollReport = async (req, res) => {
     const { month } = req.query; 
     if (!month) return res.status(400).json({ message: 'Bulan (month) wajib dikirim' });
@@ -323,9 +324,10 @@ const getPayrollReport = async (req, res) => {
         const query = `
             SELECT 
                 u.id as user_id, u.name, u.base_salary,
-                s.name as shift_name, s.start_time, s.end_time,
-                -- Durasi shift dalam detik (handle overnight: end < start)
+                s.name as shift_name, s.start_time, s.end_time, s.is_flexible,
+                -- Durasi shift dalam detik (handle overnight: end < start). NULL jika flexible.
                 CASE 
+                    WHEN s.is_flexible THEN NULL
                     WHEN s.end_time > s.start_time 
                     THEN EXTRACT(EPOCH FROM (s.end_time - s.start_time))
                     ELSE EXTRACT(EPOCH FROM (s.end_time - s.start_time + INTERVAL '24 hours'))
@@ -334,14 +336,19 @@ const getPayrollReport = async (req, res) => {
                 COUNT(a.id) as present_days,
                 SUM(CASE WHEN a.status = 'late' THEN 1 ELSE 0 END) as late_days,
                 COALESCE(SUM(
-                    LEAST(
-                        EXTRACT(EPOCH FROM (COALESCE(a.clock_out, CURRENT_TIMESTAMP) - a.clock_in)),
-                        CASE 
-                            WHEN s.end_time > s.start_time 
-                            THEN EXTRACT(EPOCH FROM (s.end_time - s.start_time))
-                            ELSE EXTRACT(EPOCH FROM (s.end_time - s.start_time + INTERVAL '24 hours'))
-                        END
-                    )
+                    CASE
+                        WHEN s.is_flexible THEN
+                            EXTRACT(EPOCH FROM (COALESCE(a.clock_out, CURRENT_TIMESTAMP) - a.clock_in))
+                        ELSE
+                            LEAST(
+                                EXTRACT(EPOCH FROM (COALESCE(a.clock_out, CURRENT_TIMESTAMP) - a.clock_in)),
+                                CASE 
+                                    WHEN s.end_time > s.start_time 
+                                    THEN EXTRACT(EPOCH FROM (s.end_time - s.start_time))
+                                    ELSE EXTRACT(EPOCH FROM (s.end_time - s.start_time + INTERVAL '24 hours'))
+                                END
+                            )
+                    END
                 ), 0) as total_worked_seconds,
                 p.id as payroll_id, p.bonus, p.deductions, p.net_salary, p.status as payroll_status, p.notes
             FROM users u
@@ -349,7 +356,7 @@ const getPayrollReport = async (req, res) => {
             LEFT JOIN attendances a ON u.id = a.user_id AND TO_CHAR(a.date, 'YYYY-MM') = $1 AND a.status IN ('ontime', 'late')
             LEFT JOIN payrolls p ON u.id = p.user_id AND p.period_month = $1
             WHERE u.shift_id IS NOT NULL
-            GROUP BY u.id, u.name, u.base_salary, s.name, s.start_time, s.end_time, p.id, p.bonus, p.deductions, p.net_salary, p.status, p.notes
+            GROUP BY u.id, u.name, u.base_salary, s.name, s.start_time, s.end_time, s.is_flexible, p.id, p.bonus, p.deductions, p.net_salary, p.status, p.notes
             ORDER BY u.name ASC
         `;
         const result = await pool.query(query, [month]);
@@ -381,18 +388,20 @@ const savePayroll = async (req, res) => {
 };
 
 // --- AUTO-CUTOFF: Gaji dihitung berdasarkan durasi shift, bukan terus berjalan ---
+// Shift flexible: tidak ada cap durasi, dihitung dari waktu kerja aktual.
 const getMyStats = async (req, res) => {
     try {
         const { user_id } = req.params;
         const month = formatLocalDate(new Date()).slice(0, 7); 
 
-        const shiftQuery = await pool.query('SELECT s.name, s.start_time, s.end_time, u.base_salary FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1', [user_id]);
+        const shiftQuery = await pool.query('SELECT s.name, s.start_time, s.end_time, s.is_flexible, u.base_salary FROM users u LEFT JOIN shifts s ON u.shift_id = s.id WHERE u.id = $1', [user_id]);
         
         const shift = shiftQuery.rows[0] || null;
+        const isFlexible = shift && shift.is_flexible;
 
-        // Hitung durasi shift dalam detik (untuk cap per hari)
+        // Hitung durasi shift dalam detik (untuk cap per hari). Tidak dipakai jika flexible.
         let shiftDurationSeconds = 28800; // default 8 jam
-        if (shift && shift.start_time && shift.end_time) {
+        if (!isFlexible && shift && shift.start_time && shift.end_time) {
             const today = formatLocalDate(new Date());
             let sStart = new Date(`${today}T${shift.start_time}`);
             let sEnd = new Date(`${today}T${shift.end_time}`);
@@ -400,18 +409,22 @@ const getMyStats = async (req, res) => {
             shiftDurationSeconds = Math.floor((sEnd - sStart) / 1000);
         }
 
-        // Untuk attendance yang masih open (belum clock_out), cap di waktu shift end hari itu
-        // Gunakan LEAST antara (clock_out atau shift_end_hari_itu atau NOW), dan durasi shift
+        // Untuk shift flexible: total_worked_seconds dihitung tanpa cap (LEAST dilewati).
+        // Untuk shift tetap: tetap di-cap oleh durasi shift seperti semula.
         const absentQuery = await pool.query(
             `SELECT COUNT(id) as total_hadir, 
              COALESCE(SUM(
-                LEAST(
-                    EXTRACT(EPOCH FROM (COALESCE(clock_out, CURRENT_TIMESTAMP) - clock_in)),
-                    $3 -- Cap berdasarkan durasi shift
-                )
+                CASE WHEN $4::boolean THEN
+                    EXTRACT(EPOCH FROM (COALESCE(clock_out, CURRENT_TIMESTAMP) - clock_in))
+                ELSE
+                    LEAST(
+                        EXTRACT(EPOCH FROM (COALESCE(clock_out, CURRENT_TIMESTAMP) - clock_in)),
+                        $3
+                    )
+                END
              ), 0) as total_worked_seconds
              FROM attendances WHERE user_id = $1 AND TO_CHAR(date, 'YYYY-MM') = $2 AND status IN ('ontime', 'late')`, 
-            [user_id, month, shiftDurationSeconds]
+            [user_id, month, shiftDurationSeconds, !!isFlexible]
         );
         
         const historyQuery = await pool.query("SELECT * FROM attendances WHERE user_id = $1 AND TO_CHAR(date, 'YYYY-MM') = $2 ORDER BY date DESC, clock_in DESC", [user_id, month]);
@@ -432,7 +445,7 @@ const getAllAttendanceHistory = async (req, res) => {
     const { month } = req.query;
     try {
         let query = `
-            SELECT a.*, u.name as user_name, s.name as shift_name 
+            SELECT a.*, u.name as user_name, s.name as shift_name, s.is_flexible
             FROM attendances a 
             JOIN users u ON a.user_id = u.id 
             LEFT JOIN shifts s ON u.shift_id = s.id

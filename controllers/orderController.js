@@ -1,7 +1,7 @@
+// ==========================================
+// CONTROLLER: ordersController.js
+// ==========================================
 const pool = require('../db/pool');
-
-// Kita TIDAK lagi menggunakan require('xendit-node')
-// Kita akan menggunakan 'fetch' bawaan Node.js v22 agar 100% stabil & tahan banting
 
 const createOrder = async (req, res) => {
     const client = await pool.connect();
@@ -9,75 +9,39 @@ const createOrder = async (req, res) => {
         await client.query('BEGIN');
         const { user_id, subtotal, discount, total, payment_method, amount_paid, change_amount, notes, items } = req.body;
 
+        // Mengambil waktu lokal dari Node.js khusus untuk format nomor order (ORD-YYYYMMDD-XXXX)
         const date = new Date();
         const dateString = date.toISOString().split('T')[0].replace(/-/g, '');
         const randomString = Math.floor(1000 + Math.random() * 9000);
         const order_number = `ORD-${dateString}-${randomString}`;
 
-        const status = payment_method === 'cash' ? 'completed' : 'pending';
+        // QRIS/Non-tunai kini langsung berstatus 'completed' tanpa perlu Xendit
+        const status = 'completed';
 
-        // 1. REQUEST QRIS KE XENDIT TERLEBIH DAHULU (Praktik Paling Aman!)
-        let qrStringData = '';
-        if (payment_method === 'non-cash') {
-            const secretKey = process.env.XENDIT_SECRET_KEY + ':';
-            const base64Key = Buffer.from(secretKey).toString('base64'); // Format keamanan wajib Xendit
+        // Proses Xendit dinonaktifkan (dihapus)
 
-            // Menembak langsung ke server Xendit menggunakan fetch bawaan Node.js
-            const xenditResponse = await fetch('https://api.xendit.co/qr_codes', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-version': '2022-07-31',
-                    'Authorization': `Basic ${base64Key}`
-                },
-                body: JSON.stringify({
-                    reference_id: order_number,
-                    type: 'DYNAMIC',
-                    currency: 'IDR',
-                    amount: Number(total)
-                })
-            });
-
-            const qrData = await xenditResponse.json();
-
-            // Jika API Key salah atau error dari Xendit
-            if (!xenditResponse.ok) {
-                // Melempar error agar ditangkap blok CATCH di bawah
-                throw new Error(qrData.message || 'Gagal generate QRIS dari Xendit');
-            }
-            
-            // Simpan sandi QRIS asli dari Xendit
-            qrStringData = qrData.qr_string;
-        }
-
-        // 2. JIKA XENDIT SUKSES (ATAU PEMBAYARAN TUNAI), BARU SIMPAN KE DATABASE
+        // Kembali menggunakan struktur kolom standar, biarkan database mengisi waktu otomatis (jika ada default) 
+        // atau gunakan CURRENT_TIMESTAMP agar aman dari error kolom tidak ditemukan.
         const orderResult = await client.query(
-            `INSERT INTO orders (user_id, order_number, subtotal, discount, total, payment_method, amount_paid, change_amount, notes, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, order_number`,
-            [user_id, order_number, subtotal, discount, total, payment_method, amount_paid, change_amount, notes, status]
+            `INSERT INTO orders (user_id, order_number, subtotal, discount, total, payment_method, amount_paid, change_amount, notes, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING id, order_number`,
+            [user_id, order_number, subtotal, discount, total, payment_method, amount_paid || total, change_amount || 0, notes, status]
         );
         const order = orderResult.rows[0];
 
         for (let item of items) {
+            const itemQty = Number(item.qty || item.quantity || 1);
+            const itemPrice = Number(item.price || 0);
+
             await client.query(
                 `INSERT INTO order_items (order_id, product_id, product_name, price, quantity, subtotal)
                  VALUES ($1, $2, $3, $4, $5, $6)`,
-                [order.id, item.product_id, item.name || item.product_name, item.price, item.qty || item.quantity, item.price * (item.qty || item.quantity)]
+                [order.id, item.product_id, item.name || item.product_name, itemPrice, itemQty, itemPrice * itemQty]
             );
-            // Kurangi stok produk
-            await client.query(`UPDATE products SET stock = stock - $1 WHERE id = $2`, [item.qty || item.quantity, item.product_id]);
+            await client.query(`UPDATE products SET stock = stock - $1 WHERE id = $2`, [itemQty, item.product_id]);
         }
+        
         await client.query('COMMIT');
-
-        // 3. KEMBALIKAN RESPON KE HALAMAN POS (REACT)
-        if (payment_method === 'non-cash') {
-            return res.status(201).json({
-                message: 'Menunggu Pembayaran',
-                order_id: order.id,
-                order_number: order.order_number,
-                qr_string: qrStringData
-            });
-        }
 
         res.status(201).json({
             message: 'Transaksi berhasil',
@@ -86,7 +50,6 @@ const createOrder = async (req, res) => {
         });
 
     } catch (error) {
-        // Jika terjadi error di Xendit atau Database, batalkan semua perubahan!
         await client.query('ROLLBACK');
         console.error("Order Error: ", error.message);
         res.status(500).json({ message: error.message });
@@ -98,7 +61,6 @@ const createOrder = async (req, res) => {
 const getOrderById = async (req, res) => {
     try {
         const { id } = req.params;
-        // Tambahkan LEFT JOIN agar cashier_name ikut terbawa
         const orderQuery = await pool.query(
             `SELECT o.*, u.name as cashier_name 
              FROM orders o 
@@ -165,7 +127,7 @@ const updateOrderStatus = async (req, res) => {
     try {
         const { id } = req.params;
         const { status } = req.body;
-        await pool.query('UPDATE orders SET status = $1 WHERE id = $2', [status, id]);
+        await pool.query('UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [status, id]);
         res.json({ message: 'Status transaksi diperbarui' });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -190,7 +152,7 @@ const xenditWebhook = async (req, res) => {
         if (event === 'qr.payment' && data.status === 'COMPLETED') {
             const order_number = data.reference_id;
             await pool.query(
-                'UPDATE orders SET status = $1 WHERE order_number = $2', 
+                'UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE order_number = $2', 
                 ['completed', order_number]
             );
         }
