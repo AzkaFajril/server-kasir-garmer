@@ -9,11 +9,8 @@ const app = express();
 // =======================
 // ALLOWED ORIGINS
 // =======================
-const allowedOrigins = [
-  'http://localhost:5173',
-  'https://kasirtokogarmer.netlify.app'
-];
-
+const cors = require('cors');
+app.use(cors()); // Mengizinkan semua domain/port mengakses API
 // =======================
 // BLOCK REQUEST DARI WEBSITE LAIN
 // =======================
