@@ -12,7 +12,7 @@ const app = express();
 const allowedOrigins = [
   'http://localhost:5173',
   'https://kasirtokogarmer.netlify.app',
-  'http://localhost:60445'
+  'http://localhost:63088'
 ];
 
 // =======================
